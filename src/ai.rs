@@ -4,8 +4,14 @@
 //! uses a different request/response shape, this is the only place you need to
 //! touch — `build_request` and the response structs.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+/// How long to wait for the provider before giving up, so a hung endpoint can't
+/// leave a request (and its typing indicator) pending forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Client for an OpenAI-compatible `/v1/chat/completions` endpoint.
 #[derive(Clone)]
@@ -14,16 +20,31 @@ pub struct AiClient {
     base_url: String,
     api_key: String,
     model: String,
+    /// Optional generation caps passed through to the provider.
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
 }
 
 impl AiClient {
-    pub fn new(base_url: String, api_key: String, model: String) -> Self {
+    pub fn new(
+        base_url: String,
+        api_key: String,
+        model: String,
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("failed to build HTTP client");
         Self {
-            http: reqwest::Client::new(),
+            http,
             // Trim a trailing slash so we can join paths predictably.
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
+            max_tokens,
+            temperature,
         }
     }
 
@@ -33,10 +54,18 @@ impl AiClient {
         let url = format!("{}/v1/chat/completions", self.base_url);
 
         let mut messages = Vec::with_capacity(history.len() + 1);
-        messages.push(ChatTurn { role: "system", content: system.to_string() });
+        messages.push(ChatTurn {
+            role: "system",
+            content: system.to_string(),
+        });
         messages.extend(history.iter().cloned());
 
-        let body = ChatRequest { model: &self.model, messages };
+        let body = ChatRequest {
+            model: &self.model,
+            messages,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+        };
 
         let resp = self
             .http
@@ -54,17 +83,24 @@ impl AiClient {
             bail!("AI provider returned {status}: {text}");
         }
 
-        let parsed: ChatResponse =
-            resp.json().await.context("failed to parse AI response")?;
+        let parsed: ChatResponse = resp.json().await.context("failed to parse AI response")?;
 
-        let reply = parsed
+        // `content` is optional because some providers send `null` (e.g. when a
+        // model returns only reasoning); treat a missing body as empty.
+        let content = parsed
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
-            .context("AI response contained no choices")?;
+            .context("AI response contained no choices")?
+            .message
+            .content
+            .unwrap_or_default();
 
-        Ok(strip_reasoning(&reply))
+        let reply = strip_reasoning(&content);
+        if reply.is_empty() {
+            bail!("AI returned an empty reply");
+        }
+        Ok(reply)
     }
 }
 
@@ -132,12 +168,18 @@ mod tests {
 
     #[test]
     fn handles_implicit_opening_tag() {
-        assert_eq!(strip_reasoning("internal reasoning</think>Visible reply."), "Visible reply.");
+        assert_eq!(
+            strip_reasoning("internal reasoning</think>Visible reply."),
+            "Visible reply."
+        );
     }
 
     #[test]
     fn leaves_normal_text_untouched() {
-        assert_eq!(strip_reasoning("  just a normal reply  "), "just a normal reply");
+        assert_eq!(
+            strip_reasoning("  just a normal reply  "),
+            "just a normal reply"
+        );
     }
 
     #[test]
@@ -157,12 +199,18 @@ impl ChatTurn {
     /// A message from a human in the chat (prefix `content` with their name so
     /// the model can tell speakers apart).
     pub fn user(content: String) -> Self {
-        Self { role: "user", content }
+        Self {
+            role: "user",
+            content,
+        }
     }
 
     /// A message the bot itself previously sent.
     pub fn assistant(content: String) -> Self {
-        Self { role: "assistant", content }
+        Self {
+            role: "assistant",
+            content,
+        }
     }
 }
 
@@ -170,6 +218,11 @@ impl ChatTurn {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatTurn>,
+    // Omitted entirely when unset so providers that reject them aren't affected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -184,5 +237,9 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct ResponseMessage {
-    content: String,
+    // Optional: providers may send `null` or omit it. Reasoning-only fields such
+    // as `reasoning_content` are ignored (serde drops unknown fields), since the
+    // answer we display always comes from `content`.
+    #[serde(default)]
+    content: Option<String>,
 }
