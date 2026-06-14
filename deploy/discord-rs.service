@@ -1,0 +1,26 @@
+# systemd unit for running Ataulfo on a Linux server (e.g. a GCP e2-micro).
+#
+# Install:
+#   1. Edit User= and the two paths below to match your server.
+#   2. sudo cp deploy/discord-rs.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now discord-rs
+#   5. journalctl -u discord-rs -f      # live logs
+#
+# WorkingDirectory must contain the binary, .env and personality.txt — the bot
+# reads .env and personality.txt from its working directory at runtime.
+
+[Unit]
+Description=discord-rs (Ataulfo) Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/discord-bot
+ExecStart=/home/YOUR_USER/discord-bot/discord-rs
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
