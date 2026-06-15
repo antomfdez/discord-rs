@@ -178,10 +178,9 @@ impl EventHandler for Handler {
             return;
         }
 
-        // Record every human message into this channel's short-term memory, so
-        // Ataulfo has context of the ongoing conversation (and who said what),
-        // even for messages that don't trigger him.
-        self.remember(msg.channel_id, ChatTurn::user(format_turn(&msg, text)));
+        // Format this message once: it's recorded into short-term memory and, when
+        // Ataulfo replies, re-used as the explicit final turn he must answer.
+        let prompt_turn = ChatTurn::user(format_turn(&msg, text));
 
         // Two ways to get Ataulfo to talk:
         //   1. The message starts with the "ataulfo" keyword.
@@ -190,6 +189,8 @@ impl EventHandler for Handler {
         let respond = match extract_prompt(&msg.content) {
             Some(after_keyword) => {
                 if after_keyword.is_empty() {
+                    // Bare trigger: still record it as context, then nudge for input.
+                    self.remember(msg.channel_id, prompt_turn);
                     let _ = msg
                         .reply(&ctx.http, "¿Sí? Dime algo después de `ataulfo`.")
                         .await;
@@ -202,6 +203,9 @@ impl EventHandler for Handler {
             None => self.is_reply_to_self(&msg) || self.is_mentioned(&msg),
         };
         if !respond {
+            // Record non-triggering messages too, so Ataulfo has context of the
+            // ongoing conversation (and who said what) for when he is addressed.
+            self.remember(msg.channel_id, prompt_turn);
             return;
         }
 
@@ -218,8 +222,15 @@ impl EventHandler for Handler {
             })
         };
 
+        // Snapshot the prior conversation as background context, then record this
+        // message for future turns. Appending the triggering message as the final
+        // turn guarantees Ataulfo answers the person who addressed him — never an
+        // older message, nor one from someone else that arrived at the same time.
+        let mut history = self.history_snapshot(msg.channel_id);
+        self.remember(msg.channel_id, prompt_turn.clone());
+        history.push(prompt_turn);
+
         let personality = self.load_personality();
-        let history = self.history_snapshot(msg.channel_id);
         let result = self.ai.complete(&personality, &history).await;
         typing.abort();
 
